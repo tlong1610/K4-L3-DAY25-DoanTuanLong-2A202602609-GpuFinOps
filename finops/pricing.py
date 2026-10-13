@@ -52,6 +52,66 @@ def discount_stack(
     return cache_mult * batch_mult
 
 
+def cache_write_cost_per_m(
+    price_in_per_m: float,
+    write_premium: float = 0.25,    # Anthropic cache write ~1.25x base input (+25%)
+    storage_per_m: float = 0.05,    # Gemini-style storage fee per 1M cached tokens per TTL window
+) -> float:
+    """Extra USD per 1M tokens to write (and keep) a prefix in cache, vs not caching it.
+
+    The premium scales with the model's input price; the storage fee does not — so
+    cheap models pay relatively more to cache.
+    """
+    return max(0.0, write_premium) * price_in_per_m + max(0.0, storage_per_m)
+
+
+def cache_break_even_reads(
+    price_in_per_m: float,
+    write_premium: float = 0.25,
+    storage_per_m: float = 0.05,
+    read_discount: float = 0.10,
+) -> float:
+    """Re-reads per cached prefix needed before caching pays off.
+
+    Each re-read saves price_in * (1 - read_discount); the write costs
+    cache_write_cost_per_m(). Break-even N* = write cost / saving per read.
+    Large model ($3/1M in): (0.75 + 0.05) / 2.70 ~= 0.30 reads.
+    Small model ($0.20/1M in): (0.05 + 0.05) / 0.18 ~= 0.56 reads.
+    """
+    saved_per_read = price_in_per_m * (1.0 - read_discount)
+    if saved_per_read <= 0:
+        return float("inf")
+    return cache_write_cost_per_m(price_in_per_m, write_premium, storage_per_m) / saved_per_read
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    price_in_per_m: float = 3.00,
+) -> bool:
+    """Caching only saves money when read savings exceed the cost of writing the cache.
+
+    avg_cache_reads  : average re-reads per cached prefix
+    write_cost_per_m : extra USD per 1M tokens to write the cache (see cache_write_cost_per_m)
+    read_discount    : cached reads billed at this fraction of input price (0.10 = -90%)
+    """
+    saved = max(0.0, avg_cache_reads) * price_in_per_m * (1.0 - read_discount)
+    return saved > write_cost_per_m
+
+
+def estimate_cache_reads(cached_tokens: float, input_tokens: float) -> float:
+    """Estimate avg re-reads per prefix from an observed cache-hit fraction.
+
+    A prefix written once and read N times has hit fraction h = N / (N + 1),
+    so N = h / (1 - h). Returns inf when every input token was a cache hit.
+    """
+    if input_tokens <= 0:
+        return 0.0
+    h = max(0.0, min(1.0, cached_tokens / input_tokens))
+    return float("inf") if h >= 1.0 else h / (1.0 - h)
+
+
 def break_even_utilization(discount_frac: float) -> float:
     """Utilization at which a commitment pays off ~= 1 - discount.
 
